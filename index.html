@@ -1,0 +1,1730 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keropok Konsaimen</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+// Placeholder global functions — akan di-override lepas Supabase load
+window.doLogin = () => alert('Supabase sedang memuatkan...');
+window.doLogout = () => {};
+window.saveKedai = () => {};
+window.saveProduk = () => {};
+window.saveVisitToSupabase = async () => null;
+</script>
+<script>
+const SUPABASE_URL = 'https://ahwxpkbglblnafjniolw.supabase.co'
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFod3hwa2JnbGJsbmFmam5pb2x3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4NDQxMzAsImV4cCI6MjA5NDQyMDEzMH0.bJnSkTx-2hubuM7GeCGD0bIv5yNhQ3N4Wkw_NsqRnvo'
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON)
+
+// ── AUTH ──
+async function checkAuth() {
+  const { data: { session } } = await sb.auth.getSession()
+  if (!session) { showLoginScreen(); return null }
+  const { data: profile } = await sb.from('profiles').select('*').eq('id', session.user.id).single()
+  window._profile = profile
+  window._session = session
+  hideLoginScreen()
+  loadDashboard()
+  subscribeRealtime()
+  return session
+}
+
+function showLoginScreen() { document.getElementById('loginOverlay').style.display = 'flex' }
+function hideLoginScreen() { document.getElementById('loginOverlay').style.display = 'none' }
+
+window.doLogin = async function() {
+  const email = document.getElementById('loginEmail').value.trim()
+  const pass = document.getElementById('loginPass').value
+  const err = document.getElementById('loginErr')
+  err.style.color = 'var(--red)'
+  err.textContent = ''
+  if (!email) { err.textContent = 'Sila masukkan email.'; return }
+
+  const btn = document.querySelector('#loginOverlay button')
+  btn.textContent = 'Memproses...'
+  btn.disabled = true
+
+  if (pass) {
+    const { error } = await sb.auth.signInWithPassword({ email, password: pass })
+    if (error) {
+      err.textContent = 'Email atau password salah: ' + error.message
+      btn.textContent = 'Log Masuk'; btn.disabled = false
+      return
+    }
+    await checkAuth()
+  } else {
+    const { error } = await sb.auth.signInWithOtp({ email })
+    if (error) {
+      err.textContent = error.message
+      btn.textContent = 'Log Masuk'; btn.disabled = false
+      return
+    }
+    err.style.color = 'var(--green)'
+    err.textContent = '✅ Magic link dihantar! Semak email kau.'
+    btn.textContent = 'Log Masuk'; btn.disabled = false
+  }
+}
+
+window.doLogout = async function() {
+  await sb.auth.signOut()
+  window._profile = null
+  showLoginScreen()
+}
+
+// ── LOAD DATA ──
+async function loadDashboard() {
+  await Promise.all([loadKedai(), loadProduk(), loadVisit()])
+  renderTrendBars()
+  updateDashboardStats()
+}
+
+async function loadKedai() {
+  const { data, error } = await sb.from('kedai').select('*, jalan(nama)').eq('aktif', true)
+  if (error) { console.error('Kedai error:', error); return }
+  window._kedai = data || []
+  renderKedaiTable()
+}
+
+async function loadProduk() {
+  const { data, error } = await sb.from('produk').select('*').eq('aktif', true)
+  if (error) { console.error('Produk error:', error); return }
+  window._produk = data || []
+  if (data && data.length) {
+    produk.length = 0
+    data.forEach((p, i) => {
+      produk.push({ nama: `${p.nama} (${p.berat||''})`, harga: parseFloat(p.harga_jual) })
+      S.stok[i] = S.stok[i] || { tinggal: 0, baru: 0 }
+    })
+  }
+}
+
+async function loadVisit() {
+  const { data, error } = await sb.from('visit')
+    .select('*, kedai(nama), profiles(nama), visit_item(*)')
+    .order('created_at', { ascending: false })
+    .limit(50)
+  if (error) { console.error('Visit error:', error); return }
+  window._visits = data || []
+  renderVisitTable()
+}
+
+function updateDashboardStats() {
+  const visits = window._visits || []
+  const today = new Date().toISOString().split('T')[0]
+  const todayVisits = visits.filter(v => v.tarikh_visit === today)
+  const monthVisits = visits.filter(v => v.status === 'selesai')
+  let unitHari = 0, unitBulan = 0, retur = 0
+  todayVisits.forEach(v => (v.visit_item||[]).forEach(i => unitHari += i.stok_baru_masuk||0))
+  monthVisits.forEach(v => (v.visit_item||[]).forEach(i => { unitBulan += i.terjual||0; retur += i.stok_tinggal||0 }))
+  const kadar = unitBulan + retur > 0 ? Math.round(unitBulan / (unitBulan + retur) * 100) : 0
+  safeSet('statUnitHari', unitHari + ' unit')
+  safeSet('statUnitBulan', unitBulan + ' unit')
+  safeSet('statRetur', retur + ' unit')
+  safeSet('statKadar', kadar + '%')
+}
+
+function safeSet(id, val) { const el = document.getElementById(id); if (el) el.textContent = val }
+
+function renderKedaiTable() {
+  const kedai = window._kedai || []
+  const tbody = document.getElementById('kedaiListTbody')
+  if (!tbody) return
+  if (!kedai.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--gray-400);padding:20px">Tiada kedai lagi. Tambah kedai dalam Android app.</td></tr>'
+    return
+  }
+  tbody.innerHTML = kedai.map(k => `
+    <tr>
+      <td><strong>${k.nama}</strong></td>
+      <td><span class="badge badge-blue">${k.jalan?.nama || '—'}</span></td>
+      <td>${k.nama_owner}</td>
+      <td>${k.no_telefon || '—'}</td>
+      <td><span style="color:var(--gray-400)">—</span></td>
+      <td><span class="badge badge-green">✓ Aktif</span></td>
+      <td><button class="btn btn-sm btn-outline">Info</button></td>
+    </tr>`).join('')
+}
+
+function renderVisitTable() {
+  const visits = window._visits || []
+  const tbody = document.getElementById('visitTbody')
+  if (!tbody) return
+  if (!visits.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--gray-400);padding:20px">Tiada rekod visit lagi.</td></tr>'
+    return
+  }
+  tbody.innerHTML = visits.slice(0, 20).map(v => {
+    const totalUnit = (v.visit_item||[]).reduce((s,i) => s + (i.terjual||0), 0)
+    return `<tr>
+      <td><code>${v.no_resit || '—'}</code></td>
+      <td><strong>${v.kedai?.nama || '—'}</strong></td>
+      <td>${v.tarikh_visit || '—'}</td>
+      <td>${totalUnit} unit</td>
+      <td><strong>RM ${parseFloat(v.jumlah_kutip||0).toFixed(2)}</strong></td>
+      <td><span class="badge badge-${v.signature_url ? 'green' : 'amber'}">${v.signature_url ? '✓ Ada' : '—'}</span></td>
+      <td><span class="badge badge-${v.status === 'selesai' ? 'green' : 'amber'}">${v.status}</span></td>
+    </tr>`}).join('')
+}
+
+// ── REALTIME ──
+function subscribeRealtime() {
+  sb.channel('db-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'visit' }, () => {
+      loadVisit().then(updateDashboardStats)
+      showRealtimeBadge()
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'kedai' }, () => loadKedai())
+    .subscribe()
+}
+
+function showRealtimeBadge() {
+  const badge = document.getElementById('realtimeBadge')
+  if (!badge) return
+  badge.style.display = 'flex'
+  setTimeout(() => badge.style.display = 'none', 3000)
+}
+
+// ── SAVE: KEDAI ──
+window.saveKedai = async function() {
+  const nama = document.getElementById('kNama')?.value.trim()
+  if (!nama) { alert('Sila isi nama kedai.'); return }
+  const { error } = await sb.from('kedai').insert({ nama, nama_owner: '—', aktif: true })
+  if (error) { alert('Ralat: ' + error.message); return }
+  alert('✅ Kedai berjaya disimpan!')
+  closeKedaiModal()
+  loadKedai()
+}
+
+// ── SAVE: PRODUK ──
+window.saveProduk = async function() {
+  const nama = document.getElementById('pNama')?.value.trim()
+  const harga = parseFloat(document.getElementById('pHarga')?.value)
+  const kos = parseFloat(document.getElementById('pKos')?.value) || 0
+  const berat = document.getElementById('pBerat')?.value.trim()
+  if (!nama || !harga) { alert('Sila isi nama produk dan harga jual.'); return }
+  if (editingProduk !== null && window._produk?.[editingProduk]) {
+    const { error } = await sb.from('produk').update({ nama, harga_jual: harga, kos_seunit: kos, berat }).eq('id', window._produk[editingProduk].id)
+    if (error) { alert('Ralat: ' + error.message); return }
+    alert(`✅ Harga ${nama} berjaya dikemaskini!`)
+  } else {
+    const { error } = await sb.from('produk').insert({ nama, harga_jual: harga, kos_seunit: kos, berat, aktif: true })
+    if (error) { alert('Ralat: ' + error.message); return }
+    alert(`✅ Produk ${nama} berjaya ditambah!`)
+  }
+  closeProdukModal()
+  loadProduk()
+}
+
+// ── SAVE: VISIT ──
+window.saveVisitToSupabase = async function(draft) {
+  const noResit = 'RES-' + Date.now().toString().slice(-5)
+  const { data: visitData, error: visitErr } = await sb.from('visit').insert({
+    kedai_id: draft.kedaiId,
+    pekerja_id: window._session?.user?.id,
+    tarikh_visit: new Date().toISOString().split('T')[0],
+    status: 'selesai',
+    jumlah_kutip: parseFloat(draft.kutip) || 0,
+    catatan: draft.catatan || '',
+    no_resit: noResit
+  }).select().single()
+  if (visitErr) { console.error('Visit save error:', visitErr); return null }
+  const items = produk.map((p, i) => ({
+    visit_id: visitData.id,
+    produk_id: window._produk?.[i]?.id,
+    stok_tinggal: S.stok[i]?.tinggal || 0,
+    stok_baru_masuk: S.stok[i]?.baru || 0,
+    harga_semasa: p.harga,
+    kos_semasa: window._produk?.[i]?.kos_seunit || 0
+  })).filter(i => i.produk_id)
+  if (items.length) await sb.from('visit_item').insert(items)
+  loadVisit().then(updateDashboardStats)
+  return noResit
+}
+
+// auth state listener
+sb.auth.onAuthStateChange((event) => {
+  if (event === 'SIGNED_IN') checkAuth()
+  if (event === 'SIGNED_OUT') showLoginScreen()
+})
+
+// init
+checkAuth()
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --primary:#2563eb;--primary-dark:#1d4ed8;--primary-light:#eff6ff;
+  --green:#16a34a;--green-light:#f0fdf4;
+  --amber:#d97706;--amber-light:#fffbeb;
+  --red:#dc2626;--red-light:#fef2f2;
+  --gray-50:#f9fafb;--gray-100:#f3f4f6;--gray-200:#e5e7eb;
+  --gray-300:#d1d5db;--gray-400:#9ca3af;--gray-500:#6b7280;
+  --gray-700:#374151;--gray-800:#1f2937;--gray-900:#111827;
+  --white:#ffffff;--radius:10px;--shadow:0 1px 3px rgba(0,0,0,.1);
+  --shadow-md:0 4px 16px rgba(0,0,0,.1);
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--gray-50);color:var(--gray-800);min-height:100vh}
+
+/* Layout */
+.app{display:flex;min-height:100vh}
+.sidebar{width:240px;background:var(--white);border-right:1px solid var(--gray-200);display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100}
+.main{margin-left:240px;flex:1;display:flex;flex-direction:column;min-height:100vh}
+.topbar{background:var(--white);border-bottom:1px solid var(--gray-200);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+.content{padding:24px;flex:1}
+
+/* Sidebar */
+.sidebar-brand{padding:20px 16px;border-bottom:1px solid var(--gray-200)}
+.brand-name{font-size:16px;font-weight:700;color:var(--gray-900)}
+.brand-sub{font-size:12px;color:var(--gray-400);margin-top:2px}
+.nav-section{padding:16px 8px 8px}
+.nav-label{font-size:11px;font-weight:600;color:var(--gray-400);text-transform:uppercase;letter-spacing:.5px;padding:0 8px;margin-bottom:4px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--gray-600);transition:all .15s;margin-bottom:2px;border:none;background:none;width:100%;text-align:left}
+.nav-item:hover{background:var(--gray-100);color:var(--gray-900)}
+.nav-item.active{background:var(--primary-light);color:var(--primary);font-weight:600}
+.nav-icon{font-size:16px;width:20px;text-align:center}
+.sidebar-footer{margin-top:auto;padding:16px;border-top:1px solid var(--gray-200);font-size:13px;color:var(--gray-500)}
+
+/* Topbar */
+.page-title{font-size:18px;font-weight:700;color:var(--gray-900)}
+.topbar-actions{display:flex;gap:8px}
+
+/* Buttons */
+.btn{padding:8px 16px;border-radius:8px;border:none;font-size:14px;font-weight:500;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:var(--primary);color:#fff}.btn-primary:hover{background:var(--primary-dark)}
+.btn-secondary{background:var(--gray-100);color:var(--gray-700)}.btn-secondary:hover{background:var(--gray-200)}
+.btn-success{background:var(--green);color:#fff}
+.btn-danger{background:var(--red);color:#fff}
+.btn-outline{background:#fff;border:1.5px solid var(--gray-200);color:var(--gray-700)}.btn-outline:hover{border-color:var(--primary);color:var(--primary)}
+.btn-sm{padding:6px 12px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* Cards */
+.card{background:var(--white);border-radius:var(--radius);border:1px solid var(--gray-200);box-shadow:var(--shadow)}
+.card-header{padding:16px 20px;border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-size:15px;font-weight:600;color:var(--gray-900)}
+.card-body{padding:20px}
+
+/* Stats */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.stat-card{background:var(--white);border-radius:var(--radius);border:1px solid var(--gray-200);padding:20px;display:flex;flex-direction:column;gap:8px}
+.stat-icon{font-size:24px}
+.stat-val{font-size:26px;font-weight:700;color:var(--gray-900)}
+.stat-label{font-size:13px;color:var(--gray-500)}
+.stat-trend{font-size:12px;color:var(--green);font-weight:500}
+
+/* Table */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;padding:10px 16px;font-size:12px;font-weight:600;color:var(--gray-500);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--gray-200);background:var(--gray-50)}
+td{padding:12px 16px;border-bottom:1px solid var(--gray-100);color:var(--gray-700)}
+tr:hover td{background:var(--gray-50)}
+tr:last-child td{border-bottom:none}
+
+/* Badges */
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.badge-green{background:var(--green-light);color:var(--green)}
+.badge-amber{background:var(--amber-light);color:var(--amber)}
+.badge-red{background:var(--red-light);color:var(--red)}
+.badge-blue{background:var(--primary-light);color:var(--primary)}
+
+/* Forms */
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:13px;font-weight:500;color:var(--gray-700);margin-bottom:6px}
+.form-input{width:100%;padding:9px 12px;border:1.5px solid var(--gray-200);border-radius:8px;font-size:14px;outline:none;transition:border .15s;background:var(--white)}
+.form-input:focus{border-color:var(--primary)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.form-select{width:100%;padding:9px 12px;border:1.5px solid var(--gray-200);border-radius:8px;font-size:14px;outline:none;background:var(--white)}
+
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--white);border-radius:14px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:var(--shadow-md)}
+.modal-header{padding:20px 24px;border-bottom:1px solid var(--gray-200);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--white);z-index:1}
+.modal-title{font-size:17px;font-weight:700}
+.modal-close{background:none;border:none;font-size:20px;cursor:pointer;color:var(--gray-400);padding:4px;border-radius:6px}
+.modal-close:hover{background:var(--gray-100)}
+.modal-body{padding:24px}
+.modal-footer{padding:16px 24px;border-top:1px solid var(--gray-200);display:flex;justify-content:flex-end;gap:8px;position:sticky;bottom:0;background:var(--white)}
+
+/* Visit step */
+.step-progress{display:flex;align-items:center;gap:0;margin-bottom:28px}
+.step-item{display:flex;flex-direction:column;align-items:center;flex:1;position:relative}
+.step-item:not(:last-child)::after{content:'';position:absolute;top:16px;left:50%;width:100%;height:2px;background:var(--gray-200);z-index:0}
+.step-item.done::after,.step-item.active::after{background:var(--primary)}
+.step-circle{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;z-index:1;border:2px solid var(--gray-200);background:var(--white);color:var(--gray-400)}
+.step-item.done .step-circle{background:var(--primary);border-color:var(--primary);color:#fff}
+.step-item.active .step-circle{border-color:var(--primary);color:var(--primary)}
+.step-label{font-size:11px;color:var(--gray-400);margin-top:4px;text-align:center}
+.step-item.active .step-label{color:var(--primary);font-weight:600}
+.step-item.done .step-label{color:var(--gray-600)}
+
+/* Stok input */
+.stok-table{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:16px}
+.stok-table th{background:var(--gray-50);padding:10px 14px;text-align:left;font-size:12px;font-weight:600;color:var(--gray-500);border-bottom:1px solid var(--gray-200)}
+.stok-table td{padding:12px 14px;border-bottom:1px solid var(--gray-100)}
+.stepper{display:flex;align-items:center;gap:8px}
+.step-btn{width:28px;height:28px;border-radius:50%;border:1.5px solid var(--gray-300);background:#fff;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;font-weight:600;color:var(--gray-600);transition:all .15s}
+.step-btn:hover{border-color:var(--primary);color:var(--primary)}
+.step-val{width:36px;text-align:center;font-size:16px;font-weight:600}
+
+/* Signature */
+.sig-wrap{border:2px dashed var(--gray-300);border-radius:10px;overflow:hidden;position:relative;cursor:crosshair;background:#fafafa}
+.sig-wrap canvas{display:block}
+.sig-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--gray-400);font-size:14px;pointer-events:none}
+
+/* Receipt */
+.receipt{border:1px solid var(--gray-200);border-radius:10px;padding:24px;font-size:14px;background:#fff}
+.receipt-header{text-align:center;padding-bottom:16px;border-bottom:2px dashed var(--gray-200);margin-bottom:16px}
+.receipt-biz{font-size:18px;font-weight:800;color:var(--gray-900)}
+.receipt-info{color:var(--gray-500);font-size:13px;margin-top:4px}
+.receipt-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--gray-100)}
+.receipt-row:last-child{border:none}
+.receipt-total{font-weight:700;font-size:16px;color:var(--green);border-top:2px solid var(--gray-200) !important;padding-top:10px !important;margin-top:4px}
+
+/* Chart bar */
+.bar-chart{display:flex;flex-direction:column;gap:12px}
+.bar-row{display:flex;align-items:center;gap:12px;font-size:13px}
+.bar-label{width:140px;color:var(--gray-600);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-track{flex:1;background:var(--gray-100);border-radius:4px;height:10px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;background:var(--primary);transition:width .6s}
+.bar-val{width:70px;text-align:right;font-weight:600;color:var(--gray-700)}
+
+/* Alert */
+.alert{padding:12px 16px;border-radius:8px;font-size:14px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.alert-success{background:var(--green-light);color:var(--green);border:1px solid #bbf7d0}
+.alert-warn{background:var(--amber-light);color:var(--amber);border:1px solid #fde68a}
+
+/* Responsive hint */
+@media(max-width:768px){.sidebar{display:none}.main{margin-left:0}.stats-grid{grid-template-columns:1fr 1fr}.form-row{grid-template-columns:1fr}}
+
+/* Page sections */
+.page{display:none}.page.active{display:block}
+.section-title{font-size:16px;font-weight:700;color:var(--gray-900);margin-bottom:16px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- Login Overlay -->
+<div id="loginOverlay" style="position:fixed;inset:0;background:rgba(17,24,39,.85);z-index:999;display:flex;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:16px;padding:36px;width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="font-size:40px;margin-bottom:8px">🍘</div>
+      <div style="font-size:20px;font-weight:800;color:var(--gray-900)">Keropok App</div>
+      <div style="font-size:13px;color:var(--gray-500);margin-top:4px">Log masuk untuk teruskan</div>
+    </div>
+    <div class="form-group"><label class="form-label">Email</label><input class="form-input" id="loginEmail" type="email" placeholder="email@kau.com"></div>
+    <div class="form-group"><label class="form-label">Password <span style="color:var(--gray-400);font-weight:400">(kosongkan untuk magic link)</span></label><input class="form-input" id="loginPass" type="password" placeholder="Password atau biar kosong"></div>
+    <div id="loginErr" style="font-size:13px;color:var(--red);margin-bottom:12px;min-height:18px"></div>
+    <button class="btn btn-primary" style="width:100%;padding:12px;font-size:15px" onclick="doLogin()">Log Masuk</button>
+    <div style="text-align:center;font-size:12px;color:var(--gray-400);margin-top:16px">Kosongkan password → magic link dihantar ke email kau</div>
+  </div>
+</div>
+
+<!-- Sidebar -->
+<div class="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-name">🍘 Keropok App</div>
+    <div class="brand-sub">Sistem Konsaimen</div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-label">Menu</div>
+    <button class="nav-item active" onclick="showPage('dashboard',this)"><span class="nav-icon">🏠</span>Dashboard</button>
+    <button class="nav-item" onclick="showPage('kedai',this)"><span class="nav-icon">🏪</span>Senarai Kedai</button>
+    <button class="nav-item" onclick="showPage('visit',this)"><span class="nav-icon">📋</span>Visit</button>
+    <button class="nav-item" onclick="showPage('laporan',this)"><span class="nav-icon">📊</span>Laporan</button>
+    <button class="nav-item" onclick="showPage('produk',this)"><span class="nav-icon">🏷️</span>Produk & Harga</button>
+  </div>
+  <div class="sidebar-footer">
+    <div style="font-weight:600;color:var(--gray-700)">Ahmad Keropok</div>
+    <div style="font-size:12px;margin-top:2px">Sungai Petani, Kedah</div>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <div class="page-title" id="pageTitle">Dashboard</div>
+    <div class="topbar-actions" id="topbarActions">
+      <div id="realtimeBadge" style="display:none;align-items:center;gap:6px;background:var(--green-light);border:1px solid #bbf7d0;padding:6px 12px;border-radius:20px;font-size:13px;color:var(--green);font-weight:600">
+        <span style="width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block"></span> Data baru diterima
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="doLogout()">Log Keluar</button>
+      <button class="btn btn-primary" onclick="openVisitModal()">+ Visit Baru</button>
+    </div>
+  </div>
+
+  <!-- Content -->
+  <div class="content">
+
+    <!-- DASHBOARD -->
+    <div class="page active" id="page-dashboard">
+
+      <!-- KPI row -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px">
+        <div class="stat-card" style="border-left:4px solid var(--primary)">
+          <div class="stat-label">Stok diagih hari ini</div>
+          <div class="stat-val" style="color:var(--primary)" id="statUnitHari">— unit</div>
+          <div class="stat-trend">Dari visit selesai</div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid var(--green)">
+          <div class="stat-label">Unit terjual bulan ini</div>
+          <div class="stat-val" style="color:var(--green)" id="statUnitBulan">— unit</div>
+          <div class="stat-trend">Semua visit selesai</div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid var(--amber)">
+          <div class="stat-label">Stok tak laku (retur)</div>
+          <div class="stat-val" style="color:var(--amber)" id="statRetur">— unit</div>
+          <div class="stat-trend">Baki tinggal kat kedai</div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid #8b5cf6">
+          <div class="stat-label">Kadar laku bulan ini</div>
+          <div class="stat-val" style="color:#8b5cf6" id="statKadar">—%</div>
+          <div class="stat-trend">Terjual / diagih</div>
+        </div>
+      </div>
+
+      <!-- Row 2: Stok diagih & Kadar laku per produk -->
+      <div class="two-col" style="margin-bottom:20px">
+
+        <div class="card">
+          <div class="card-header"><span class="card-title">Stok diagih vs terjual (bulan ini)</span></div>
+          <div class="card-body">
+            <div style="display:flex;flex-direction:column;gap:14px">
+
+              <div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px">
+                  <span style="font-weight:600">Keropok Kecil (50g)</span>
+                  <span style="color:var(--gray-500)">185 terjual / 205 diagih</span>
+                </div>
+                <div style="height:10px;background:var(--gray-100);border-radius:6px;overflow:hidden;display:flex">
+                  <div style="width:90%;background:var(--green);border-radius:6px 0 0 6px"></div>
+                  <div style="width:10%;background:var(--amber);opacity:.6"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--gray-400);margin-top:3px"><span style="color:var(--green)">90.2% laku</span><span style="color:var(--amber)">20 unit retur</span></div>
+              </div>
+
+              <div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px">
+                  <span style="font-weight:600">Keropok Sederhana (100g)</span>
+                  <span style="color:var(--gray-500)">124 terjual / 138 diagih</span>
+                </div>
+                <div style="height:10px;background:var(--gray-100);border-radius:6px;overflow:hidden;display:flex">
+                  <div style="width:90%;background:var(--green);border-radius:6px 0 0 6px"></div>
+                  <div style="width:10%;background:var(--amber);opacity:.6"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--gray-400);margin-top:3px"><span style="color:var(--green)">89.9% laku</span><span style="color:var(--amber)">14 unit retur</span></div>
+              </div>
+
+              <div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px">
+                  <span style="font-weight:600">Keropok Besar (200g)</span>
+                  <span style="color:var(--gray-500)">68 terjual / 76 diagih</span>
+                </div>
+                <div style="height:10px;background:var(--gray-100);border-radius:6px;overflow:hidden;display:flex">
+                  <div style="width:89%;background:var(--green);border-radius:6px 0 0 6px"></div>
+                  <div style="width:11%;background:var(--amber);opacity:.6"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--gray-400);margin-top:3px"><span style="color:var(--green)">89.5% laku</span><span style="color:var(--amber)">8 unit retur</span></div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><span class="card-title">Trend unit terjual (6 minggu)</span></div>
+          <div class="card-body" style="padding-bottom:8px">
+            <div style="display:flex;align-items:flex-end;gap:6px;height:120px;margin-bottom:8px" id="trendBars"></div>
+            <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--gray-500)">
+              <span style="width:10px;height:10px;border-radius:2px;background:var(--primary);display:inline-block"></span> Unit terjual per minggu
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Row 3: Visit hari ini & Stok semasa per kedai -->
+      <div class="two-col" style="margin-bottom:20px">
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Visit hari ini</span>
+            <button class="btn btn-sm btn-primary" onclick="openVisitModal()">+ Baru</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Kedai</th><th style="text-align:center">Diagih</th><th style="text-align:center">Terjual</th><th style="text-align:center">Retur</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Kedai Ah Seng</strong><div style="font-size:11px;color:var(--gray-400)">9:30 pagi</div></td>
+                  <td style="text-align:center">16</td>
+                  <td style="text-align:center;color:var(--green);font-weight:600">14</td>
+                  <td style="text-align:center;color:var(--amber)">2</td>
+                  <td><span class="badge badge-green">✓ Selesai</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Mini Market Hashim</strong><div style="font-size:11px;color:var(--gray-400)">11:15 pagi</div></td>
+                  <td style="text-align:center">20</td>
+                  <td style="text-align:center;color:var(--green);font-weight:600">19</td>
+                  <td style="text-align:center;color:var(--green)">1</td>
+                  <td><span class="badge badge-green">✓ Selesai</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Muthu</strong><div style="font-size:11px;color:var(--gray-400)">2:00 petang</div></td>
+                  <td style="text-align:center">11</td>
+                  <td style="text-align:center;color:var(--green);font-weight:600">11</td>
+                  <td style="text-align:center;color:var(--green)">0</td>
+                  <td><span class="badge badge-green">✓ Selesai</span></td>
+                </tr>
+                <tr style="background:var(--gray-50)">
+                  <td><strong>Kedai Amy</strong><div style="font-size:11px;color:var(--gray-400)">Belum dilawati</div></td>
+                  <td style="text-align:center;color:var(--gray-400)">—</td>
+                  <td style="text-align:center;color:var(--gray-400)">—</td>
+                  <td style="text-align:center;color:var(--gray-400)">—</td>
+                  <td><span class="badge badge-amber">⏳ Belum</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><span class="card-title">Kedai perlu dilawati minggu ini</span></div>
+          <div class="card-body" style="padding:0">
+            <table style="width:100%;font-size:13px">
+              <thead><tr><th style="padding:10px 16px;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Kedai</th><th style="padding:10px 16px;text-align:center;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Stok semasa</th><th style="padding:10px 16px;text-align:center;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Hari ke-</th><th style="padding:10px 16px;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Keutamaan</th></tr></thead>
+              <tbody>
+                <tr><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><strong>Kedai Zali</strong></td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center;font-weight:600;color:var(--red)">3 unit</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center">Hari ke-8</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><span class="badge badge-red">Segera</span></td></tr>
+                <tr><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><strong>Kedai Amy</strong></td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center;font-weight:600;color:var(--amber)">7 unit</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center">Hari ke-7</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><span class="badge badge-amber">Hari ini</span></td></tr>
+                <tr><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><strong>Kedai Runcit Nab</strong></td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center;font-weight:600;color:var(--amber)">9 unit</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100);text-align:center">Hari ke-6</td><td style="padding:10px 16px;border-bottom:1px solid var(--gray-100)"><span class="badge badge-amber">Esok</span></td></tr>
+                <tr><td style="padding:10px 16px"><strong>Kedai Ah Keong</strong></td><td style="padding:10px 16px;text-align:center;font-weight:600;color:var(--green)">15 unit</td><td style="padding:10px 16px;text-align:center">Hari ke-5</td><td style="padding:10px 16px"><span class="badge badge-blue">2 hari lagi</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Row 4: Ringkasan stok keseluruhan -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">Ringkasan stok keseluruhan (semua kedai)</span></div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px">
+
+            <div style="text-align:center;padding:16px;background:var(--gray-50);border-radius:10px">
+              <div style="font-size:12px;color:var(--gray-500);margin-bottom:6px">Jumlah stok aktif</div>
+              <div style="font-size:28px;font-weight:800;color:var(--primary)">419</div>
+              <div style="font-size:12px;color:var(--gray-400)">unit kat semua kedai</div>
+            </div>
+
+            <div style="text-align:center;padding:16px;background:var(--green-light);border-radius:10px">
+              <div style="font-size:12px;color:var(--green);margin-bottom:6px">Diagih bulan ini</div>
+              <div style="font-size:28px;font-weight:800;color:var(--green)">419</div>
+              <div style="font-size:12px;color:var(--gray-400)">unit keluar</div>
+            </div>
+
+            <div style="text-align:center;padding:16px;background:var(--amber-light);border-radius:10px">
+              <div style="font-size:12px;color:var(--amber);margin-bottom:6px">Jumlah retur</div>
+              <div style="font-size:28px;font-weight:800;color:var(--amber)">42</div>
+              <div style="font-size:12px;color:var(--gray-400)">unit dikembalikan</div>
+            </div>
+
+            <div style="text-align:center;padding:16px;background:var(--primary-light);border-radius:10px">
+              <div style="font-size:12px;color:var(--primary);margin-bottom:6px">Kadar laku</div>
+              <div style="font-size:28px;font-weight:800;color:var(--primary)">90%</div>
+              <div style="font-size:12px;color:var(--gray-400)">daripada yang diagih</div>
+            </div>
+
+          </div>
+
+          <div style="margin-top:16px">
+            <div style="font-size:13px;font-weight:600;color:var(--gray-700);margin-bottom:8px">Agihan stok per produk (bulan ini)</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;align-items:center;gap:12px;font-size:13px">
+                <span style="width:160px;color:var(--gray-600)">Keropok Kecil (50g)</span>
+                <div style="flex:1;height:20px;background:var(--gray-100);border-radius:4px;overflow:hidden;display:flex">
+                  <div style="width:49%;background:#3b82f6;display:flex;align-items:center;padding-left:6px"><span style="font-size:10px;color:#fff;font-weight:600">205 diagih</span></div>
+                  <div style="width:5%;background:var(--amber);opacity:.7"></div>
+                </div>
+                <span style="width:60px;text-align:right;font-size:12px;color:var(--gray-500)">205 unit</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px;font-size:13px">
+                <span style="width:160px;color:var(--gray-600)">Keropok Sederhana (100g)</span>
+                <div style="flex:1;height:20px;background:var(--gray-100);border-radius:4px;overflow:hidden;display:flex">
+                  <div style="width:33%;background:#8b5cf6;display:flex;align-items:center;padding-left:6px"><span style="font-size:10px;color:#fff;font-weight:600">138 diagih</span></div>
+                  <div style="width:3%;background:var(--amber);opacity:.7"></div>
+                </div>
+                <span style="width:60px;text-align:right;font-size:12px;color:var(--gray-500)">138 unit</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px;font-size:13px">
+                <span style="width:160px;color:var(--gray-600)">Keropok Besar (200g)</span>
+                <div style="flex:1;height:20px;background:var(--gray-100);border-radius:4px;overflow:hidden;display:flex">
+                  <div style="width:18%;background:#ec4899;display:flex;align-items:center;padding-left:6px"><span style="font-size:10px;color:#fff;font-weight:600">76 diagih</span></div>
+                  <div style="width:2%;background:var(--amber);opacity:.7"></div>
+                </div>
+                <span style="width:60px;text-align:right;font-size:12px;color:var(--gray-500)">76 unit</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:16px;margin-top:10px;font-size:12px;color:var(--gray-500)">
+              <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:2px;background:#3b82f6;display:inline-block"></span>Terjual</span>
+              <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:2px;background:var(--amber);opacity:.7;display:inline-block"></span>Retur</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- KEDAI -->
+    <div class="page" id="page-kedai">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <div class="section-title" style="margin:0">Senarai Kedai <span id="kedaiBilangan" style="color:var(--gray-400);font-weight:400;font-size:14px">(38 kedai · 4 jalan)</span></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline" onclick="openJalanModal()">🛣 Urus Jalan</button>
+          <button class="btn btn-primary" onclick="openKedaiModal()">+ Tambah Kedai</button>
+        </div>
+      </div>
+
+      <!-- Filter bar -->
+      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+        <input class="form-input" style="max-width:220px" placeholder="🔍 Cari nama kedai..." oninput="filterKedai(this.value)">
+        <select class="form-select" style="max-width:180px" id="filterJalan" onchange="filterKedai()">
+          <option value="">Semua jalan</option>
+          <option>Jalan Besar</option>
+          <option>Jalan Raja</option>
+          <option>Jalan Kenari</option>
+          <option>Jalan Semarak</option>
+        </select>
+        <select class="form-select" style="max-width:160px" id="filterStatus" onchange="filterKedai()">
+          <option value="">Semua status</option>
+          <option>Perlu dilawati</option>
+          <option>Aktif</option>
+        </select>
+        <div style="display:flex;border:1.5px solid var(--gray-200);border-radius:8px;overflow:hidden;margin-left:auto">
+          <button class="btn btn-sm active-view" id="viewGroup" onclick="switchView('group')" style="border-radius:0;background:var(--primary);color:#fff">Ikut Jalan</button>
+          <button class="btn btn-sm" id="viewList" onclick="switchView('list')" style="border-radius:0">Senarai</button>
+        </div>
+      </div>
+
+      <!-- GROUP VIEW -->
+      <div id="kedaiGroupView">
+
+        <!-- Jalan Besar -->
+        <div class="card" style="margin-bottom:16px">
+          <div style="padding:12px 16px;background:var(--primary-light);border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleGroup('jalanBesar')">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:18px">🛣</span>
+              <div>
+                <div style="font-weight:700;color:var(--primary)">Jalan Besar</div>
+                <div style="font-size:12px;color:var(--gray-500)">12 kedai · Visit: Isnin & Khamis</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="badge badge-amber">3 perlu visit</span>
+              <span id="toggleJalanBesar" style="color:var(--gray-400);font-size:18px">▾</span>
+            </div>
+          </div>
+          <div id="jalanBesar">
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>#</th><th>Nama Kedai</th><th>Owner</th><th>Telefon</th><th>Stok semasa</th><th>Status</th><th>Tindakan</th></tr></thead>
+                <tbody>
+                  <tr><td style="color:var(--gray-400)">1</td><td><strong>Kedai Runcit Ah Seng</strong></td><td>Ah Seng</td><td>012-3456789</td><td><span style="color:var(--amber);font-weight:600">7 unit</span></td><td><span class="badge badge-amber">⚠ Perlu visit</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td style="color:var(--gray-400)">2</td><td><strong>Kedai Runcit Lim</strong></td><td>Lim</td><td>012-1111222</td><td><span style="color:var(--green);font-weight:600">15 unit</span></td><td><span class="badge badge-green">✓ Aktif</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td style="color:var(--gray-400)">3</td><td><strong>Pasar Mini Siti</strong></td><td>Siti</td><td>013-2223334</td><td><span style="color:var(--red);font-weight:600">2 unit</span></td><td><span class="badge badge-red">🔴 Segera</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td colspan="7" style="padding:8px 16px;color:var(--gray-400);font-size:13px;text-align:center">+ 9 kedai lagi dalam Jalan Besar</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Jalan Raja -->
+        <div class="card" style="margin-bottom:16px">
+          <div style="padding:12px 16px;background:#f0fdf4;border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleGroup('jalanRaja')">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:18px">🛣</span>
+              <div>
+                <div style="font-weight:700;color:var(--green)">Jalan Raja</div>
+                <div style="font-size:12px;color:var(--gray-500)">9 kedai · Visit: Selasa & Jumaat</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="badge badge-green">Semua aktif</span>
+              <span id="toggleJalanRaja" style="color:var(--gray-400);font-size:18px">▾</span>
+            </div>
+          </div>
+          <div id="jalanRaja">
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>#</th><th>Nama Kedai</th><th>Owner</th><th>Telefon</th><th>Stok semasa</th><th>Status</th><th>Tindakan</th></tr></thead>
+                <tbody>
+                  <tr><td style="color:var(--gray-400)">1</td><td><strong>Kedai Runcit Muthu</strong></td><td>Muthu</td><td>013-9876543</td><td><span style="color:var(--green);font-weight:600">18 unit</span></td><td><span class="badge badge-green">✓ Aktif</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td style="color:var(--gray-400)">2</td><td><strong>Kedai Runcit Karim</strong></td><td>Karim</td><td>011-5556667</td><td><span style="color:var(--green);font-weight:600">22 unit</span></td><td><span class="badge badge-green">✓ Aktif</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td colspan="7" style="padding:8px 16px;color:var(--gray-400);font-size:13px;text-align:center">+ 7 kedai lagi dalam Jalan Raja</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Jalan Kenari -->
+        <div class="card" style="margin-bottom:16px">
+          <div style="padding:12px 16px;background:#fdf4ff;border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleGroup('jalanKenari')">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:18px">🛣</span>
+              <div>
+                <div style="font-weight:700;color:#7c3aed">Jalan Kenari</div>
+                <div style="font-size:12px;color:var(--gray-500)">10 kedai · Visit: Rabu</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="badge badge-amber">2 perlu visit</span>
+              <span id="toggleJalanKenari" style="color:var(--gray-400);font-size:18px">▾</span>
+            </div>
+          </div>
+          <div id="jalanKenari">
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>#</th><th>Nama Kedai</th><th>Owner</th><th>Telefon</th><th>Stok semasa</th><th>Status</th><th>Tindakan</th></tr></thead>
+                <tbody>
+                  <tr><td style="color:var(--gray-400)">1</td><td><strong>Kedai Amy</strong></td><td>Amy</td><td>016-1234567</td><td><span style="color:var(--amber);font-weight:600">8 unit</span></td><td><span class="badge badge-amber">⚠ Perlu visit</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td style="color:var(--gray-400)">2</td><td><strong>Kedai Runcit Nab</strong></td><td>Nab</td><td>017-3334445</td><td><span style="color:var(--green);font-weight:600">14 unit</span></td><td><span class="badge badge-green">✓ Aktif</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td colspan="7" style="padding:8px 16px;color:var(--gray-400);font-size:13px;text-align:center">+ 8 kedai lagi dalam Jalan Kenari</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Jalan Semarak -->
+        <div class="card" style="margin-bottom:16px">
+          <div style="padding:12px 16px;background:#fff7ed;border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleGroup('jalanSemarak')">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:18px">🛣</span>
+              <div>
+                <div style="font-weight:700;color:var(--amber)">Jalan Semarak</div>
+                <div style="font-size:12px;color:var(--gray-500)">7 kedai · Visit: Sabtu</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="badge badge-amber">1 perlu visit</span>
+              <span id="toggleJalanSemarak" style="color:var(--gray-400);font-size:18px">▾</span>
+            </div>
+          </div>
+          <div id="jalanSemarak">
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>#</th><th>Nama Kedai</th><th>Owner</th><th>Telefon</th><th>Stok semasa</th><th>Status</th><th>Tindakan</th></tr></thead>
+                <tbody>
+                  <tr><td style="color:var(--gray-400)">1</td><td><strong>Kedai Runcit Zali</strong></td><td>Zali</td><td>014-8765432</td><td><span style="color:var(--red);font-weight:600">3 unit</span></td><td><span class="badge badge-amber">⚠ Perlu visit</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td style="color:var(--gray-400)">2</td><td><strong>Mini Market Hashim</strong></td><td>Hashim</td><td>011-2345678</td><td><span style="color:var(--green);font-weight:600">20 unit</span></td><td><span class="badge badge-green">✓ Aktif</span></td><td style="display:flex;gap:6px"><button class="btn btn-sm btn-primary" onclick="openVisitModal()">Visit</button><button class="btn btn-sm btn-outline">Info</button></td></tr>
+                  <tr><td colspan="7" style="padding:8px 16px;color:var(--gray-400);font-size:13px;text-align:center">+ 5 kedai lagi dalam Jalan Semarak</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- LIST VIEW -->
+      <div id="kedaiListView" style="display:none">
+        <div class="card">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Nama Kedai</th><th>Jalan</th><th>Owner</th><th>Telefon</th><th>Stok semasa</th><th>Status</th><th>Tindakan</th></tr></thead>
+              <tbody id="kedaiListTbody">
+                <tr><td colspan="7" style="text-align:center;color:var(--gray-400);padding:20px">Memuatkan data...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- VISIT -->
+    <div class="page" id="page-visit">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <div class="section-title" style="margin:0">Rekod Visit</div>
+        <button class="btn btn-primary" onclick="openVisitModal()">+ Visit Baru</button>
+      </div>
+      <div class="card">
+        <div style="padding:14px 16px;border-bottom:1px solid var(--gray-200);display:flex;gap:10px">
+          <input class="form-input" style="max-width:260px" placeholder="🔍 Cari kedai...">
+          <input class="form-input" type="month" style="max-width:180px" value="2025-05">
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>No. Resit</th><th>Kedai</th><th>Tarikh</th><th>Terjual</th><th>Dikutip</th><th>Tandatangan</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td><code>RES-10234</code></td><td>Kedai Ah Seng</td><td>14 Mei 2025</td><td>16 unit</td><td><strong>RM 37.50</strong></td><td><span class="badge badge-green">✓ Ada</span></td><td><span class="badge badge-green">Selesai</span></td></tr>
+              <tr><td><code>RES-10233</code></td><td>Mini Market Hashim</td><td>13 Mei 2025</td><td>28 unit</td><td><strong>RM 62.00</strong></td><td><span class="badge badge-green">✓ Ada</span></td><td><span class="badge badge-green">Selesai</span></td></tr>
+              <tr><td><code>RES-10232</code></td><td>Kedai Muthu</td><td>12 Mei 2025</td><td>20 unit</td><td><strong>RM 45.00</strong></td><td><span class="badge badge-green">✓ Ada</span></td><td><span class="badge badge-green">Selesai</span></td></tr>
+              <tr><td><code>RES-10231</code></td><td>Kedai Amy</td><td>11 Mei 2025</td><td>13 unit</td><td><strong>RM 28.50</strong></td><td><span class="badge badge-green">✓ Ada</span></td><td><span class="badge badge-green">Selesai</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- PRODUK & HARGA -->
+    <div class="page" id="page-produk">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <div class="section-title" style="margin:0">Produk & Harga Keropok</div>
+        <button class="btn btn-primary" onclick="openProdukModal()">+ Tambah Produk</button>
+      </div>
+      <div class="alert alert-warn">⚠ Perubahan harga akan dipakai pada visit baru sahaja. Rekod lama tidak berubah.</div>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Nama / Saiz</th><th>Berat</th><th>Harga Jual (RM)</th><th>Kos Seunit (RM)</th><th>Untung / unit</th><th>Status</th><th>Tindakan</th></tr></thead>
+            <tbody id="produkTable">
+              <tr>
+                <td><strong>Keropok Kecil</strong></td>
+                <td>50g</td>
+                <td><span class="editable-price" data-id="0">1.50</span></td>
+                <td><span class="editable-cost" data-id="0">0.80</span></td>
+                <td style="color:var(--green);font-weight:600">RM 0.70</td>
+                <td><span class="badge badge-green">Aktif</span></td>
+                <td style="display:flex;gap:6px">
+                  <button class="btn btn-sm btn-outline" onclick="openEditProduk(0)">✏ Edit</button>
+                  <button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Nyahaktif</button>
+                </td>
+              </tr>
+              <tr>
+                <td><strong>Keropok Sederhana</strong></td>
+                <td>100g</td>
+                <td><span class="editable-price" data-id="1">2.50</span></td>
+                <td><span class="editable-cost" data-id="1">1.30</span></td>
+                <td style="color:var(--green);font-weight:600">RM 1.20</td>
+                <td><span class="badge badge-green">Aktif</span></td>
+                <td style="display:flex;gap:6px">
+                  <button class="btn btn-sm btn-outline" onclick="openEditProduk(1)">✏ Edit</button>
+                  <button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Nyahaktif</button>
+                </td>
+              </tr>
+              <tr>
+                <td><strong>Keropok Besar</strong></td>
+                <td>200g</td>
+                <td><span class="editable-price" data-id="2">4.50</span></td>
+                <td><span class="editable-cost" data-id="2">2.20</span></td>
+                <td style="color:var(--green);font-weight:600">RM 2.30</td>
+                <td><span class="badge badge-green">Aktif</span></td>
+                <td style="display:flex;gap:6px">
+                  <button class="btn btn-sm btn-outline" onclick="openEditProduk(2)">✏ Edit</button>
+                  <button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Nyahaktif</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="two-col" style="margin-top:20px">
+        <div class="card">
+          <div class="card-header"><span class="card-title">📈 Margin Untung</span></div>
+          <div class="card-body">
+            <div class="bar-chart">
+              <div class="bar-row"><span class="bar-label">Kecil (50g)</span><div class="bar-track"><div class="bar-fill" style="width:46%;background:#16a34a"></div></div><span class="bar-val">46%</span></div>
+              <div class="bar-row"><span class="bar-label">Sederhana (100g)</span><div class="bar-track"><div class="bar-fill" style="width:48%;background:#16a34a"></div></div><span class="bar-val">48%</span></div>
+              <div class="bar-row"><span class="bar-label">Besar (200g)</span><div class="bar-track"><div class="bar-fill" style="width:51%;background:#16a34a"></div></div><span class="bar-val">51%</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">📋 Sejarah Perubahan Harga</span></div>
+          <div class="card-body" style="padding:0">
+            <table style="font-size:13px">
+              <thead><tr><th>Produk</th><th>Harga Lama</th><th>Harga Baru</th><th>Tarikh</th></tr></thead>
+              <tbody>
+                <tr><td>Kecil</td><td>RM 1.20</td><td>RM 1.50</td><td>1 Jan 2025</td></tr>
+                <tr><td>Sederhana</td><td>RM 2.00</td><td>RM 2.50</td><td>1 Jan 2025</td></tr>
+                <tr><td>Besar</td><td>RM 4.00</td><td>RM 4.50</td><td>1 Mac 2025</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LAPORAN -->
+    <div class="page" id="page-laporan">
+
+      <!-- Filter bar -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;flex-wrap:wrap">
+        <select class="form-select" style="max-width:160px" id="filterBulan" onchange="renderLaporan()">
+          <option value="5">Mei 2025</option>
+          <option value="4">April 2025</option>
+          <option value="3">Mac 2025</option>
+        </select>
+        <div style="display:flex;border:1.5px solid var(--gray-200);border-radius:8px;overflow:hidden">
+          <button class="btn btn-sm" id="tabKeseluruhan" onclick="switchLaporan('keseluruhan')" style="border-radius:0;background:var(--primary);color:#fff">Keseluruhan</button>
+          <button class="btn btn-sm" id="tabProduk" onclick="switchLaporan('produk')" style="border-radius:0">Per Produk</button>
+          <button class="btn btn-sm" id="tabKedai" onclick="switchLaporan('kedai')" style="border-radius:0">Per Kedai</button>
+        </div>
+        <button class="btn btn-sm btn-outline" style="margin-left:auto">📥 Export CSV</button>
+      </div>
+
+      <!-- KESELURUHAN -->
+      <div id="laporan-keseluruhan">
+        <!-- KPI row -->
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px">
+          <div class="stat-card" style="border-left:4px solid var(--primary)">
+            <div class="stat-label">Jumlah hasil jualan</div>
+            <div class="stat-val" style="color:var(--primary)">RM 4,820</div>
+            <div class="stat-trend">↑ 12% vs bulan lepas</div>
+          </div>
+          <div class="stat-card" style="border-left:4px solid var(--green)">
+            <div class="stat-label">Jumlah keuntungan bersih</div>
+            <div class="stat-val" style="color:var(--green)">RM 2,166</div>
+            <div class="stat-trend">↑ 14% vs bulan lepas</div>
+          </div>
+          <div class="stat-card" style="border-left:4px solid var(--amber)">
+            <div class="stat-label">Jumlah kos</div>
+            <div class="stat-val" style="color:var(--amber)">RM 2,654</div>
+            <div class="stat-trend">↑ 10% vs bulan lepas</div>
+          </div>
+          <div class="stat-card" style="border-left:4px solid #8b5cf6">
+            <div class="stat-label">Margin keuntungan</div>
+            <div class="stat-val" style="color:#8b5cf6">44.9%</div>
+            <div class="stat-trend">↑ 0.8pp vs bulan lepas</div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <!-- Trend bulanan -->
+          <div class="card">
+            <div class="card-header"><span class="card-title">Trend keuntungan bersih (6 bulan)</span></div>
+            <div class="card-body" style="padding-bottom:8px">
+              <div style="display:flex;align-items:flex-end;gap:8px;height:140px;margin-bottom:8px">
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);opacity:.4;border-radius:4px 4px 0 0;height:52%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500)">Dis</span>
+                </div>
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);opacity:.5;border-radius:4px 4px 0 0;height:60%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500)">Jan</span>
+                </div>
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);opacity:.6;border-radius:4px 4px 0 0;height:68%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500)">Feb</span>
+                </div>
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);opacity:.7;border-radius:4px 4px 0 0;height:74%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500)">Mac</span>
+                </div>
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);opacity:.85;border-radius:4px 4px 0 0;height:85%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500)">Apr</span>
+                </div>
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                  <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                    <div style="width:100%;background:var(--primary);border-radius:4px 4px 0 0;height:100%"></div>
+                  </div>
+                  <span style="font-size:11px;color:var(--gray-500);font-weight:700">Mei</span>
+                </div>
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--gray-500)">
+                <span>RM 1,124</span><span>RM 1,298</span><span>RM 1,470</span><span>RM 1,592</span><span>RM 1,900</span><span style="font-weight:700;color:var(--primary)">RM 2,166</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Bahagian hasil vs kos vs untung -->
+          <div class="card">
+            <div class="card-header"><span class="card-title">Pecahan hasil bulan ini</span></div>
+            <div class="card-body">
+              <!-- stacked bar -->
+              <div style="height:36px;border-radius:8px;overflow:hidden;display:flex;margin-bottom:16px">
+                <div style="flex:2654;background:var(--amber);opacity:.8" title="Kos"></div>
+                <div style="flex:2166;background:var(--green)" title="Untung"></div>
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px">
+                <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:2px;background:var(--amber);opacity:.8;display:inline-block"></span>Kos: <strong>RM 2,654</strong> (55.1%)</div>
+                <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:2px;background:var(--green);display:inline-block"></span>Untung: <strong>RM 2,166</strong> (44.9%)</div>
+              </div>
+              <table style="width:100%;font-size:13px">
+                <thead><tr><th style="padding:6px 0;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Minggu</th><th style="text-align:right;padding:6px 0;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Hasil</th><th style="text-align:right;padding:6px 0;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Untung</th><th style="text-align:right;padding:6px 0;font-size:11px;color:var(--gray-500);font-weight:600;text-transform:uppercase">Margin</th></tr></thead>
+                <tbody>
+                  <tr><td style="padding:7px 0;border-bottom:1px solid var(--gray-100)">M1 (1–7 Mei)</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">RM 1,050</td><td style="text-align:right;border-bottom:1px solid var(--gray-100);color:var(--green);font-weight:600">RM 466</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">44.4%</td></tr>
+                  <tr><td style="padding:7px 0;border-bottom:1px solid var(--gray-100)">M2 (8–14 Mei)</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">RM 1,220</td><td style="text-align:right;border-bottom:1px solid var(--gray-100);color:var(--green);font-weight:600">RM 554</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">45.4%</td></tr>
+                  <tr><td style="padding:7px 0;border-bottom:1px solid var(--gray-100)">M3 (15–21 Mei)</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">RM 1,380</td><td style="text-align:right;border-bottom:1px solid var(--gray-100);color:var(--green);font-weight:600">RM 624</td><td style="text-align:right;border-bottom:1px solid var(--gray-100)">45.2%</td></tr>
+                  <tr><td style="padding:7px 0">M4 (22–31 Mei)</td><td style="text-align:right">RM 1,170</td><td style="text-align:right;color:var(--green);font-weight:600">RM 522</td><td style="text-align:right">44.6%</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PER PRODUK -->
+      <div id="laporan-produk" style="display:none">
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-header"><span class="card-title">Analisis keuntungan per produk</span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Produk</th><th style="text-align:right">Hasil (RM)</th><th style="text-align:right">Kos (RM)</th><th style="text-align:right">Untung bersih (RM)</th><th style="text-align:right">Margin</th><th>Sumbangan</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Keropok Kecil</strong><div style="font-size:12px;color:var(--gray-400)">Jual RM1.50 · Kos RM0.80</div></td>
+                  <td style="text-align:right">RM 277.50</td>
+                  <td style="text-align:right;color:var(--amber)">RM 148.00</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 129.50</td>
+                  <td style="text-align:right"><span class="badge badge-green">46.7%</span></td>
+                  <td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;background:var(--gray-100);border-radius:4px;height:8px"><div style="width:22%;background:var(--primary);border-radius:4px;height:100%"></div></div><span style="font-size:12px;color:var(--gray-500)">22%</span></div></td>
+                </tr>
+                <tr>
+                  <td><strong>Keropok Sederhana</strong><div style="font-size:12px;color:var(--gray-400)">Jual RM2.50 · Kos RM1.30</div></td>
+                  <td style="text-align:right">RM 310.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 161.20</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 148.80</td>
+                  <td style="text-align:right"><span class="badge badge-green">48.0%</span></td>
+                  <td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;background:var(--gray-100);border-radius:4px;height:8px"><div style="width:28%;background:var(--primary);border-radius:4px;height:100%"></div></div><span style="font-size:12px;color:var(--gray-500)">28%</span></div></td>
+                </tr>
+                <tr>
+                  <td><strong>Keropok Besar</strong><div style="font-size:12px;color:var(--gray-400)">Jual RM4.50 · Kos RM2.20</div></td>
+                  <td style="text-align:right">RM 306.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 149.60</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 156.40</td>
+                  <td style="text-align:right"><span class="badge badge-green">51.1%</span></td>
+                  <td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;background:var(--gray-100);border-radius:4px;height:8px"><div style="width:50%;background:var(--primary);border-radius:4px;height:100%"></div></div><span style="font-size:12px;color:var(--gray-500)">50%</span></div></td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr style="background:var(--gray-50);font-weight:700">
+                  <td>Jumlah keseluruhan</td>
+                  <td style="text-align:right">RM 893.50</td>
+                  <td style="text-align:right;color:var(--amber)">RM 458.80</td>
+                  <td style="text-align:right;color:var(--green)">RM 434.70</td>
+                  <td style="text-align:right"><span class="badge badge-green">48.7%</span></td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Produk paling menguntungkan</span></div>
+          <div class="card-body">
+            <div style="display:flex;gap:12px">
+              <div style="flex:1;background:var(--green-light);border:1px solid #bbf7d0;border-radius:10px;padding:16px;text-align:center">
+                <div style="font-size:12px;color:var(--green);font-weight:600;margin-bottom:4px">🏆 MARGIN TERTINGGI</div>
+                <div style="font-size:16px;font-weight:700">Keropok Besar</div>
+                <div style="font-size:24px;font-weight:800;color:var(--green)">51.1%</div>
+                <div style="font-size:12px;color:var(--gray-500)">Untung RM2.30 / unit</div>
+              </div>
+              <div style="flex:1;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:10px;padding:16px;text-align:center">
+                <div style="font-size:12px;color:var(--primary);font-weight:600;margin-bottom:4px">💰 UNTUNG TERTINGGI</div>
+                <div style="font-size:16px;font-weight:700">Keropok Besar</div>
+                <div style="font-size:24px;font-weight:800;color:var(--primary)">RM 156.40</div>
+                <div style="font-size:12px;color:var(--gray-500)">50% sumbangan untung</div>
+              </div>
+              <div style="flex:1;background:var(--amber-light);border:1px solid #fde68a;border-radius:10px;padding:16px;text-align:center">
+                <div style="font-size:12px;color:var(--amber);font-weight:600;margin-bottom:4px">⚠ MARGIN PALING RENDAH</div>
+                <div style="font-size:16px;font-weight:700">Keropok Kecil</div>
+                <div style="font-size:24px;font-weight:800;color:var(--amber)">46.7%</div>
+                <div style="font-size:12px;color:var(--gray-500)">Pertimbang naikkan harga</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PER KEDAI -->
+      <div id="laporan-kedai" style="display:none">
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-header"><span class="card-title">Analisis keuntungan per kedai</span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Kedai</th><th style="text-align:right">Hasil (RM)</th><th style="text-align:right">Kos (RM)</th><th style="text-align:right">Untung bersih (RM)</th><th style="text-align:right">Margin</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Mini Market Hashim</strong><div style="font-size:12px;color:var(--gray-400)">Taman Aman, SP</div></td>
+                  <td style="text-align:right">RM 620.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 337.00</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 283.00</td>
+                  <td style="text-align:right"><span class="badge badge-green">45.6%</span></td>
+                  <td><span class="badge badge-green">🏆 Terbaik</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Runcit Ah Seng</strong><div style="font-size:12px;color:var(--gray-400)">Jalan Besar, SP</div></td>
+                  <td style="text-align:right">RM 480.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 263.00</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 217.00</td>
+                  <td style="text-align:right"><span class="badge badge-green">45.2%</span></td>
+                  <td><span class="badge badge-blue">Stabil</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Amy</strong><div style="font-size:12px;color:var(--gray-400)">Kompleks SP</div></td>
+                  <td style="text-align:right">RM 390.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 214.50</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 175.50</td>
+                  <td style="text-align:right"><span class="badge badge-green">45.0%</span></td>
+                  <td><span class="badge badge-blue">Stabil</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Runcit Muthu</strong><div style="font-size:12px;color:var(--gray-400)">Jalan Raja, SP</div></td>
+                  <td style="text-align:right">RM 320.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 180.00</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 140.00</td>
+                  <td style="text-align:right"><span class="badge badge-green">43.8%</span></td>
+                  <td><span class="badge badge-amber">Sederhana</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Runcit Zali</strong><div style="font-size:12px;color:var(--gray-400)">Taman Sejahtera, SP</div></td>
+                  <td style="text-align:right">RM 250.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 145.00</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 105.00</td>
+                  <td style="text-align:right"><span class="badge badge-amber">42.0%</span></td>
+                  <td><span class="badge badge-amber">Perlu pantau</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Kedai Lain-lain</strong><div style="font-size:12px;color:var(--gray-400)">33 kedai lain</div></td>
+                  <td style="text-align:right">RM 2,760.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 1,514.50</td>
+                  <td style="text-align:right;font-weight:700;color:var(--green)">RM 1,245.50</td>
+                  <td style="text-align:right"><span class="badge badge-green">45.1%</span></td>
+                  <td></td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr style="background:var(--gray-50);font-weight:700">
+                  <td>Jumlah (38 kedai)</td>
+                  <td style="text-align:right">RM 4,820.00</td>
+                  <td style="text-align:right;color:var(--amber)">RM 2,654.00</td>
+                  <td style="text-align:right;color:var(--green)">RM 2,166.00</td>
+                  <td style="text-align:right"><span class="badge badge-green">44.9%</span></td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Kedai perlu perhatian</span></div>
+          <div class="card-body">
+            <div style="display:flex;gap:12px">
+              <div style="flex:1;background:var(--red-light);border:1px solid #fecaca;border-radius:10px;padding:16px">
+                <div style="font-size:12px;color:var(--red);font-weight:600;margin-bottom:6px">⚠ MARGIN PALING RENDAH</div>
+                <div style="font-size:15px;font-weight:700">Kedai Runcit Zali</div>
+                <div style="font-size:22px;font-weight:800;color:var(--red);margin:4px 0">42.0%</div>
+                <div style="font-size:12px;color:var(--gray-600)">Margin 2.9pp bawah purata. Semak sama ada ada isu stok rosak atau pembayaran tertunggak.</div>
+              </div>
+              <div style="flex:1;background:var(--green-light);border:1px solid #bbf7d0;border-radius:10px;padding:16px">
+                <div style="font-size:12px;color:var(--green);font-weight:600;margin-bottom:6px">💡 PELUANG PERTUMBUHAN</div>
+                <div style="font-size:15px;font-weight:700">Mini Market Hashim</div>
+                <div style="font-size:22px;font-weight:800;color:var(--green);margin:4px 0">RM 283 / bulan</div>
+                <div style="font-size:12px;color:var(--gray-600)">Kedai terbaik. Pertimbang tambah kuantiti stok untuk tingkatkan untung lagi.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /main -->
+
+<!-- MODAL: Edit Produk -->
+<div class="modal-overlay" id="produkModal" style="display:none" onclick="if(event.target===this)closeProdukModal()">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-header">
+      <div class="modal-title" id="produkModalTitle">Tambah Produk</div>
+      <button class="modal-close" onclick="closeProdukModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Nama Produk *</label><input class="form-input" id="pNama" placeholder="Contoh: Keropok Kecil"></div>
+        <div class="form-group"><label class="form-label">Berat / Saiz *</label><input class="form-input" id="pBerat" placeholder="Contoh: 50g, 100g"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Harga Jual (RM) *</label>
+          <div style="position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--gray-400);font-weight:600">RM</span><input class="form-input" id="pHarga" type="number" step="0.10" min="0" placeholder="0.00" style="padding-left:40px"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Kos Seunit (RM)</label>
+          <div style="position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--gray-400);font-weight:600">RM</span><input class="form-input" id="pKos" type="number" step="0.10" min="0" placeholder="0.00" style="padding-left:40px" oninput="updateMargin()"></div>
+        </div>
+      </div>
+      <div id="marginPreview" style="background:var(--green-light);border:1px solid #bbf7d0;border-radius:8px;padding:12px;font-size:13px;display:none">
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--gray-600)">Untung seunit</span><strong id="marginVal" style="color:var(--green)">RM 0.00</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px">
+          <span style="color:var(--gray-600)">Margin</span><strong id="marginPct" style="color:var(--green)">0%</strong>
+        </div>
+      </div>
+      <div class="form-group" style="margin-top:16px"><label class="form-label">Catatan (opsyen)</label><input class="form-input" id="pCatatan" placeholder="Contoh: packaging baru, stok terhad..."></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeProdukModal()">Batal</button>
+      <button class="btn btn-primary" onclick="saveProduk()">Simpan</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: Urus Jalan -->
+<div class="modal-overlay" id="jalanModal" style="display:none" onclick="if(event.target===this)closeJalanModal()">
+  <div class="modal" style="max-width:460px">
+    <div class="modal-header">
+      <div class="modal-title">Urus Jalan / Route</div>
+      <button class="modal-close" onclick="closeJalanModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--primary-light);border-radius:8px;border:1px solid #bfdbfe">
+          <div><div style="font-weight:600;color:var(--primary)">Jalan Besar</div><div style="font-size:12px;color:var(--gray-500)">12 kedai · Isnin & Khamis</div></div>
+          <div style="display:flex;gap:6px"><button class="btn btn-sm btn-outline">✏ Edit</button><button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Padam</button></div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0">
+          <div><div style="font-weight:600;color:var(--green)">Jalan Raja</div><div style="font-size:12px;color:var(--gray-500)">9 kedai · Selasa & Jumaat</div></div>
+          <div style="display:flex;gap:6px"><button class="btn btn-sm btn-outline">✏ Edit</button><button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Padam</button></div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#fdf4ff;border-radius:8px;border:1px solid #e9d5ff">
+          <div><div style="font-weight:600;color:#7c3aed">Jalan Kenari</div><div style="font-size:12px;color:var(--gray-500)">10 kedai · Rabu</div></div>
+          <div style="display:flex;gap:6px"><button class="btn btn-sm btn-outline">✏ Edit</button><button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Padam</button></div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#fff7ed;border-radius:8px;border:1px solid #fde68a">
+          <div><div style="font-weight:600;color:var(--amber)">Jalan Semarak</div><div style="font-size:12px;color:var(--gray-500)">7 kedai · Sabtu</div></div>
+          <div style="display:flex;gap:6px"><button class="btn btn-sm btn-outline">✏ Edit</button><button class="btn btn-sm" style="background:var(--red-light);color:var(--red)">Padam</button></div>
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--gray-200);padding-top:16px">
+        <div style="font-weight:600;margin-bottom:10px;font-size:14px">+ Tambah Jalan Baru</div>
+        <div class="form-row">
+          <div class="form-group"><label class="form-label">Nama Jalan *</label><input class="form-input" placeholder="Contoh: Jalan Merdeka"></div>
+          <div class="form-group"><label class="form-label">Hari visit</label><select class="form-select"><option>Isnin</option><option>Selasa</option><option>Rabu</option><option>Khamis</option><option>Jumaat</option><option>Sabtu</option><option>Ahad</option></select></div>
+        </div>
+        <button class="btn btn-primary" onclick="alert('Jalan baru ditambah!')">Tambah Jalan</button>
+      </div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-secondary" onclick="closeJalanModal()">Tutup</button></div>
+  </div>
+</div>
+
+<!-- MODAL: Tambah Kedai -->
+<div class="modal-overlay" id="kedaiModal" style="display:none" onclick="if(event.target===this)closeKedaiModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">Tambah Kedai Baru</div>
+      <button class="modal-close" onclick="closeKedaiModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Nama Kedai *</label><input class="form-input" id="pNama" placeholder="Contoh: Kedai Runcit Ali"></div>
+        <div class="form-group"><label class="form-label">Nama Owner *</label><input class="form-input" id="kNama" placeholder="Nama owner kedai"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">No. Telefon</label><input class="form-input" type="tel" placeholder="01X-XXXXXXX"></div>
+        <div class="form-group"><label class="form-label">Jalan / Route *</label><select class="form-select"><option value="">-- Pilih Jalan --</option><option>Jalan Besar</option><option>Jalan Raja</option><option>Jalan Kenari</option><option>Jalan Semarak</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Alamat Kedai</label><input class="form-input" placeholder="No, Jalan, Taman, Bandar"></div>
+        <div class="form-group"><label class="form-label">Tempoh konsaimen</label><select class="form-select"><option>1 minggu</option><option>2 minggu</option><option>Sebulan</option></select></div>
+      </div>
+      <div class="form-group"><label class="form-label">Catatan (opsyen)</label><textarea class="form-input" rows="2" placeholder="Maklumat tambahan..."></textarea></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeKedaiModal()">Batal</button>
+      <button class="btn btn-primary" onclick="saveKedai()">Simpan Kedai</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: Visit Flow -->
+<div class="modal-overlay" id="visitModal" style="display:none" onclick="if(event.target===this)closeVisitModal()">
+  <div class="modal" style="max-width:620px">
+    <div class="modal-header">
+      <div class="modal-title" id="visitModalTitle">Visit Baru</div>
+      <button class="modal-close" onclick="closeVisitModal()">✕</button>
+    </div>
+    <div class="modal-body" id="visitModalBody"></div>
+    <div class="modal-footer" id="visitModalFooter"></div>
+  </div>
+</div>
+
+<script>
+// State
+const S = {
+  visitStep: 0,
+  selectedKedai: null,
+  stok: { 0:{tinggal:0,baru:5}, 1:{tinggal:2,baru:8}, 2:{tinggal:1,baru:3} },
+  kutip: '',
+  hasSig: false,
+  sigUrl: null,
+  noResit: '',
+};
+
+const kedaiList = [
+  {id:0,nama:'Kedai Runcit Ah Seng',owner:'Ah Seng',alamat:'No 12, Jalan Besar, SP'},
+  {id:1,nama:'Mini Market Hashim',owner:'Hashim',alamat:'Taman Aman, SP'},
+  {id:2,nama:'Kedai Runcit Muthu',owner:'Muthu',alamat:'Jalan Raja, SP'},
+  {id:3,nama:'Kedai Amy',owner:'Amy',alamat:'Kompleks SP'},
+  {id:4,nama:'Kedai Runcit Zali',owner:'Zali',alamat:'Taman Sejahtera, SP'},
+];
+
+const produk = [
+  {nama:'Kecil (50g)',harga:1.50},
+  {nama:'Sederhana (100g)',harga:2.50},
+  {nama:'Besar (200g)',harga:4.50},
+];
+
+function fmt(n){return 'RM '+Number(n).toFixed(2)}
+function totalJualan(){return produk.reduce((s,p,i)=>s+(S.stok[i]?.baru||0)*p.harga,0)}
+
+// Render trend bars
+function renderTrendBars() {
+  const wrap = document.getElementById('trendBars');
+  if (!wrap) return;
+  const data = [['M1',62],['M2',74],['M3',88],['M4',95],['M5',82],['M6',110],['M7',107]];
+  const max = Math.max(...data.map(d=>d[1]));
+  wrap.innerHTML = data.map(([label, val], i) => {
+    const h = Math.round((val/max)*100);
+    const isLast = i === data.length - 1;
+    const op = isLast ? '1' : (0.3 + i * 0.1).toFixed(1);
+    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px">
+      <div style="font-size:10px;color:var(--gray-500);font-weight:${isLast?'700':'400'}">${val}</div>
+      <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+        <div style="width:100%;background:var(--primary);opacity:${op};border-radius:4px 4px 0 0;height:${h}%"></div>
+      </div>
+      <span style="font-size:10px;color:var(--gray-500);font-weight:${isLast?'700':'400'}">${label}</span>
+    </div>`;
+  }).join('');
+}
+
+// Laporan tabs
+let laporanTab = 'keseluruhan';
+function switchLaporan(tab) {
+  laporanTab = tab;
+  ['keseluruhan','produk','kedai'].forEach(t => {
+    document.getElementById('laporan-'+t).style.display = t===tab?'block':'none';
+    const btn = document.getElementById('tab'+t.charAt(0).toUpperCase()+t.slice(1));
+    if(btn){ btn.style.background = t===tab?'var(--primary)':''; btn.style.color = t===tab?'#fff':''; }
+  });
+}
+function renderLaporan() {}
+
+function openJalanModal(){document.getElementById('jalanModal').style.display='flex'}
+function closeJalanModal(){document.getElementById('jalanModal').style.display='none'}
+
+function toggleGroup(id){
+  const el=document.getElementById(id);
+  const icon=document.getElementById('toggle'+id.charAt(0).toUpperCase()+id.slice(1));
+  if(!el||!icon) return;
+  const hidden=el.style.display==='none';
+  el.style.display=hidden?'block':'none';
+  icon.textContent=hidden?'▾':'▸';
+}
+
+function switchView(v){
+  document.getElementById('kedaiGroupView').style.display=v==='group'?'block':'none';
+  document.getElementById('kedaiListView').style.display=v==='list'?'block':'none';
+  document.getElementById('viewGroup').style.background=v==='group'?'var(--primary)':'';
+  document.getElementById('viewGroup').style.color=v==='group'?'#fff':'';
+  document.getElementById('viewList').style.background=v==='list'?'var(--primary)':'';
+  document.getElementById('viewList').style.color=v==='list'?'#fff':'';
+}
+
+function filterKedai(q){}
+
+// Produk modal
+const produkData=[
+  {nama:'Keropok Kecil',berat:'50g',harga:1.50,kos:0.80},
+  {nama:'Keropok Sederhana',berat:'100g',harga:2.50,kos:1.30},
+  {nama:'Keropok Besar',berat:'200g',harga:4.50,kos:2.20},
+];
+let editingProduk=null;
+
+function openProdukModal(){
+  editingProduk=null;
+  document.getElementById('produkModalTitle').textContent='Tambah Produk Baru';
+  ['pNama','pBerat','pHarga','pKos','pCatatan'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('marginPreview').style.display='none';
+  document.getElementById('produkModal').style.display='flex';
+}
+
+function openEditProduk(i){
+  editingProduk=i;
+  const p=produkData[i];
+  document.getElementById('produkModalTitle').textContent='Edit Produk — '+p.nama;
+  document.getElementById('pNama').value=p.nama;
+  document.getElementById('pBerat').value=p.berat;
+  document.getElementById('pHarga').value=p.harga.toFixed(2);
+  document.getElementById('pKos').value=p.kos.toFixed(2);
+  document.getElementById('pCatatan').value='';
+  updateMargin();
+  document.getElementById('produkModal').style.display='flex';
+}
+
+function closeProdukModal(){document.getElementById('produkModal').style.display='none'}
+
+function updateMargin(){
+  const harga=parseFloat(document.getElementById('pHarga').value)||0;
+  const kos=parseFloat(document.getElementById('pKos').value)||0;
+  const preview=document.getElementById('marginPreview');
+  if(harga>0&&kos>0){
+    const untung=harga-kos;
+    const pct=((untung/harga)*100).toFixed(1);
+    document.getElementById('marginVal').textContent=fmt(untung);
+    document.getElementById('marginPct').textContent=pct+'%';
+    preview.style.display='block';
+    preview.style.background=untung>0?'var(--green-light)':'var(--red-light)';
+    preview.style.borderColor=untung>0?'#bbf7d0':'#fecaca';
+    document.getElementById('marginVal').style.color=untung>0?'var(--green)':'var(--red)';
+    document.getElementById('marginPct').style.color=untung>0?'var(--green)':'var(--red)';
+  } else { preview.style.display='none'; }
+}
+
+function saveProduk(){
+  const nama=document.getElementById('pNama').value.trim();
+  const harga=parseFloat(document.getElementById('pHarga').value);
+  if(!nama||!harga){alert('Sila isi nama produk dan harga jual.');return}
+  const p={nama,berat:document.getElementById('pBerat').value,harga,kos:parseFloat(document.getElementById('pKos').value)||0};
+  if(editingProduk!==null){
+    produkData[editingProduk]=p;
+    produk[editingProduk]={nama:`${p.nama} (${p.berat})`,harga:p.harga};
+    alert(`✅ Harga ${p.nama} berjaya dikemaskini ke RM ${p.harga.toFixed(2)}!`);
+  } else {
+    produkData.push(p);
+    produk.push({nama:`${p.nama} (${p.berat})`,harga:p.harga});
+    S.stok[produk.length-1]={tinggal:0,baru:0};
+    alert(`✅ Produk ${p.nama} berjaya ditambah!`);
+  }
+  closeProdukModal();
+}
+
+// Page nav
+function showPage(id, el) {
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  if(el) el.classList.add('active');
+  const titles = {dashboard:'Dashboard',kedai:'Senarai Kedai',visit:'Rekod Visit',laporan:'Laporan',produk:'Produk & Harga'};
+  document.getElementById('pageTitle').textContent = titles[id]||id;
+  if(id==='dashboard') setTimeout(renderTrendBars, 50);
+}
+
+// init
+renderTrendBars();
+
+// Kedai modal
+function openKedaiModal(){document.getElementById('kedaiModal').style.display='flex'}
+function closeKedaiModal(){document.getElementById('kedaiModal').style.display='none'}
+function saveKedai(){
+  closeKedaiModal();
+  alert('✅ Kedai baru berjaya disimpan!');
+}
+
+// Visit modal
+function openVisitModal(){
+  S.visitStep=0;S.selectedKedai=null;S.hasSig=false;S.sigUrl=null;S.kutip='';
+  Object.keys(S.stok).forEach(k=>{S.stok[k]={tinggal:0,baru:5}});
+  document.getElementById('visitModal').style.display='flex';
+  renderVisitStep();
+}
+function closeVisitModal(){document.getElementById('visitModal').style.display='none'}
+
+const stepLabels=['Pilih Kedai','Rekod Stok','Kutip Bayaran','Tandatangan','Resit'];
+
+function stepProgress(){
+  return `<div class="step-progress">${stepLabels.map((l,i)=>`
+    <div class="step-item ${i<S.visitStep?'done':i===S.visitStep?'active':''}">
+      <div class="step-circle">${i<S.visitStep?'✓':i+1}</div>
+      <div class="step-label">${l}</div>
+    </div>`).join('')}</div>`;
+}
+
+function renderVisitStep(){
+  document.getElementById('visitModalTitle').textContent=`Visit Baru — ${stepLabels[S.visitStep]}`;
+  const body=document.getElementById('visitModalBody');
+  const foot=document.getElementById('visitModalFooter');
+
+  const backBtn=S.visitStep>0?`<button class="btn btn-secondary" onclick="visitPrev()">‹ Balik</button>`:'';
+  const nextLabel=S.visitStep===4?'Selesai':'Seterusnya →';
+  const nextFn=S.visitStep===4?'closeVisitModal()':'visitNext()';
+  const nextDisabled=S.visitStep===0&&S.selectedKedai===null||S.visitStep===2&&!S.kutip||S.visitStep===3&&!S.hasSig;
+
+  foot.innerHTML=`${backBtn}<button class="btn btn-primary" onclick="${nextFn}" ${nextDisabled?'disabled':''}>${nextLabel}</button>`;
+
+  if(S.visitStep===0){
+    body.innerHTML=stepProgress()+`
+    <p style="font-size:13px;color:var(--gray-500);margin-bottom:14px">Pilih kedai yang nak dilawati.</p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${kedaiList.map(k=>`
+      <div onclick="selectKedai(${k.id})" style="padding:12px 16px;border:2px solid ${S.selectedKedai===k.id?'var(--primary)':'var(--gray-200)'};border-radius:10px;cursor:pointer;background:${S.selectedKedai===k.id?'var(--primary-light)':'#fff'};display:flex;align-items:center;gap:12px;transition:all .15s">
+        <span style="font-size:20px">🏪</span>
+        <div style="flex:1"><div style="font-weight:600;font-size:14px">${k.nama}</div><div style="font-size:12px;color:var(--gray-500)">${k.owner} · ${k.alamat}</div></div>
+        ${S.selectedKedai===k.id?'<span style="color:var(--primary);font-size:18px">✓</span>':''}
+      </div>`).join('')}
+    </div>`;
+  }
+
+  else if(S.visitStep===1){
+    const k=kedaiList[S.selectedKedai];
+    body.innerHTML=stepProgress()+`
+    <div class="alert alert-warn">🏪 <strong>${k.nama}</strong> — ${k.owner}</div>
+    <table class="stok-table">
+      <thead><tr><th>Produk</th><th>Harga</th><th>Baki tinggal</th><th>Stok baru masuk</th></tr></thead>
+      <tbody>
+        ${produk.map((p,i)=>`<tr>
+          <td><strong>${p.nama}</strong></td>
+          <td>${fmt(p.harga)}</td>
+          <td><div class="stepper"><button class="step-btn" onclick="updStok(${i},'tinggal',-1)">−</button><span class="step-val" id="t${i}">${S.stok[i].tinggal}</span><button class="step-btn" onclick="updStok(${i},'tinggal',1)">+</button></div></td>
+          <td><div class="stepper"><button class="step-btn" onclick="updStok(${i},'baru',-1)">−</button><span class="step-val" id="b${i}">${S.stok[i].baru}</span><button class="step-btn" onclick="updStok(${i},'baru',1)">+</button></div></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div style="text-align:right;font-size:15px;font-weight:700;color:var(--primary)">Anggaran jualan: <span id="jumlahJualan">${fmt(totalJualan())}</span></div>`;
+  }
+
+  else if(S.visitStep===2){
+    const total=totalJualan();
+    const kutip=parseFloat(S.kutip)||0;
+    const beza=kutip-total;
+    body.innerHTML=stepProgress()+`
+    <div style="margin-bottom:16px">
+      <div class="card-title" style="margin-bottom:10px">Breakdown Jualan</div>
+      ${produk.map((p,i)=>`<div class="receipt-row"><span>${p.nama}</span><span style="color:var(--gray-400)">${S.stok[i].baru} unit</span><span style="font-weight:600">${fmt(S.stok[i].baru*p.harga)}</span></div>`).join('')}
+      <div class="receipt-row receipt-total"><span>Jumlah patut dikutip</span><span>${fmt(total)}</span></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Amaun sebenar dikutip (RM) *</label>
+      <input class="form-input" type="number" step="0.01" placeholder="0.00" value="${S.kutip}" oninput="S.kutip=this.value;updateHint(${total})" id="kutipInput" style="font-size:20px;font-weight:700;padding:14px">
+      <div id="kutipHint" style="margin-top:8px;font-size:13px"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Catatan (opsyen)</label><textarea class="form-input" rows="2" placeholder="Ada stok rosak, owner minta tangguh..."></textarea></div>`;
+    setTimeout(()=>{
+      if(S.kutip) updateHint(total);
+      document.getElementById('kutipInput')?.focus();
+    },50);
+  }
+
+  else if(S.visitStep===3){
+    const k=kedaiList[S.selectedKedai];
+    body.innerHTML=stepProgress()+`
+    <p style="font-size:13px;color:var(--gray-500);margin-bottom:14px">Minta <strong>${k.owner}</strong> tandatangan di bawah sebagai pengesahan.</p>
+    <div class="sig-wrap" style="margin-bottom:12px">
+      <canvas id="sigCanvas" width="560" height="180"></canvas>
+      <div class="sig-placeholder" id="sigPH">✍ Tandatangan di sini...</div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <button class="btn btn-sm btn-outline" style="color:var(--red)" onclick="clearSig()">🗑 Padam</button>
+      ${S.hasSig?'<span style="color:var(--green);font-size:13px;font-weight:600">✓ Tandatangan diterima</span>':''}
+    </div>
+    <div style="background:var(--gray-50);border-radius:8px;padding:12px;font-size:13px">
+      <div class="receipt-row"><span class="info-label">Kedai</span><span>${k.nama}</span></div>
+      <div class="receipt-row"><span class="info-label">Tarikh</span><span>${new Date().toLocaleDateString('ms-MY',{day:'numeric',month:'long',year:'numeric'})}</span></div>
+      <div class="receipt-row"><span class="info-label">Dikutip</span><span style="color:var(--green);font-weight:700">${fmt(S.kutip||0)}</span></div>
+    </div>`;
+    setTimeout(setupCanvas,80);
+  }
+
+  else if(S.visitStep===4){
+    S.noResit='RES-'+Math.floor(10000+Math.random()*90000);
+    const k=kedaiList[S.selectedKedai];
+    body.innerHTML=stepProgress()+`
+    <div style="text-align:center;padding:16px 0">
+      <div style="font-size:52px">✅</div>
+      <div style="font-size:20px;font-weight:800;margin:8px 0">Visit Selesai!</div>
+      <div style="color:var(--gray-500);font-size:14px">Resit telah dijana dan disimpan</div>
+    </div>
+    <div class="receipt">
+      <div class="receipt-header">
+        <div class="receipt-biz">🍘 KEROPOK KONSAIMEN</div>
+        <div class="receipt-info">${S.noResit} · ${new Date().toLocaleDateString('ms-MY')}</div>
+      </div>
+      <div class="receipt-row"><span>Kedai</span><strong>${k.nama}</strong></div>
+      <div class="receipt-row"><span>Owner</span><span>${k.owner}</span></div>
+      <div style="height:8px"></div>
+      ${produk.map((p,i)=>`<div class="receipt-row"><span>${p.nama}</span><span style="color:var(--gray-400)">${S.stok[i].baru} unit</span><strong>${fmt(S.stok[i].baru*p.harga)}</strong></div>`).join('')}
+      <div class="receipt-row receipt-total"><span>Jumlah dikutip</span><span>${fmt(S.kutip||0)}</span></div>
+      ${S.sigUrl?`<div style="margin-top:12px"><div style="font-size:12px;color:var(--gray-400);margin-bottom:4px">Tandatangan owner:</div><img src="${S.sigUrl}" style="max-height:60px;border:1px solid var(--gray-200);border-radius:6px;padding:4px"></div>`:''}
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn btn-success" style="flex:1" onclick="alert('PDF akan dijana dan dikongsi...')">📄 Kongsi PDF</button>
+      <button class="btn btn-outline" style="flex:1;color:#25d366;border-color:#25d366" onclick="alert('Resit akan dihantar ke WhatsApp '+kedaiList[S.selectedKedai].owner+'...')">💬 WhatsApp</button>
+    </div>`;
+  }
+}
+
+function selectKedai(id){
+  S.selectedKedai=id;
+  renderVisitStep();
+}
+
+function visitNext(){
+  S.visitStep++;
+  renderVisitStep();
+}
+
+function visitPrev(){
+  S.visitStep--;
+  renderVisitStep();
+}
+
+function updStok(i,field,delta){
+  S.stok[i][field]=Math.max(0,(S.stok[i][field]||0)+delta);
+  const el=document.getElementById((field==='tinggal'?'t':'b')+i);
+  if(el) el.textContent=S.stok[i][field];
+  const jEl=document.getElementById('jumlahJualan');
+  if(jEl) jEl.textContent=fmt(totalJualan());
+}
+
+function updateHint(total){
+  const kutip=parseFloat(document.getElementById('kutipInput')?.value)||0;
+  S.kutip=kutip;
+  const beza=kutip-total;
+  const el=document.getElementById('kutipHint');
+  if(el && kutip>0) el.innerHTML=beza>=0?`<span style="color:var(--green);font-weight:600">✓ Tepat / lebih RM ${beza.toFixed(2)}</span>`:`<span style="color:var(--amber);font-weight:600">⚠ Kurang RM ${Math.abs(beza).toFixed(2)}</span>`;
+  // update next btn
+  document.querySelector('#visitModalFooter .btn-primary').disabled=!kutip;
+}
+
+function setupCanvas(){
+  const canvas=document.getElementById('sigCanvas');
+  if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  ctx.strokeStyle='#111827';ctx.lineWidth=2;ctx.lineCap='round';ctx.lineJoin='round';
+  let drawing=false;
+  function pos(e){const r=canvas.getBoundingClientRect();const s=e.touches?e.touches[0]:e;return{x:(s.clientX-r.left)*(canvas.width/r.width),y:(s.clientY-r.top)*(canvas.height/r.height)}}
+  function start(e){e.preventDefault();drawing=true;const p=pos(e);ctx.beginPath();ctx.moveTo(p.x,p.y);document.getElementById('sigPH').style.display='none'}
+  function move(e){e.preventDefault();if(!drawing)return;const p=pos(e);ctx.lineTo(p.x,p.y);ctx.stroke()}
+  function end(e){e.preventDefault();drawing=false;S.hasSig=true;S.sigUrl=canvas.toDataURL();document.querySelector('#visitModalFooter .btn-primary').disabled=false}
+  canvas.addEventListener('mousedown',start);canvas.addEventListener('mousemove',move);canvas.addEventListener('mouseup',end);
+  canvas.addEventListener('touchstart',start,{passive:false});canvas.addEventListener('touchmove',move,{passive:false});canvas.addEventListener('touchend',end,{passive:false});
+}
+
+function clearSig(){
+  const canvas=document.getElementById('sigCanvas');
+  if(!canvas) return;
+  canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+  S.hasSig=false;S.sigUrl=null;
+  document.getElementById('sigPH').style.display='flex';
+  document.querySelector('#visitModalFooter .btn-primary').disabled=true;
+  renderVisitStep();
+  setTimeout(setupCanvas,80);
+}
+</script>
+</body>
+</html>
